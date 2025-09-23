@@ -1,6 +1,6 @@
 use crate::types::MessageType;
-use uuid::Uuid;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 // GossipSub消息结构
 #[derive(Debug, Clone)]
@@ -39,6 +39,16 @@ impl GossipMessage {
         self
     }
 
+    pub fn with_message_ids(mut self, message_ids: Vec<String>) -> Self {
+        self.message_ids = message_ids;
+        self
+    }
+
+    pub fn with_to(mut self, to: String) -> Self {
+        self.to = Some(to);
+        self
+    }
+
     pub fn with_from(mut self, from: String) -> Self {
         self.from = Some(from);
         self
@@ -48,7 +58,7 @@ impl GossipMessage {
         Uuid::new_v4().to_string()
     }
 
-    fn current_timestamp() -> u64 {
+    pub fn current_timestamp() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

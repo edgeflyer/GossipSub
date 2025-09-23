@@ -10,6 +10,8 @@ pub struct GossipSubNode {
     pub fanout: HashMap<String, HashSet<String>>, // fanout网络
     pub message_cache: HashMap<String, GossipMessage>, // messageId -> message
     pub seen_messages: HashSet<String>, // 已见过的消息ID
+    pub gossip_history: HashMap<String, Vec<String>>, // topic -> 最近的消息ID列表
+    pub iwant_requests: HashMap<String, u64>, // messageId -> 请求时间戳
     pub config: GossipSubConfig,
 }
 
@@ -25,6 +27,8 @@ impl GossipSubNode {
             fanout: HashMap::new(),
             message_cache: HashMap::new(),
             seen_messages: HashSet::new(),
+            gossip_history: HashMap::new(),
+            iwant_requests: HashMap::new(),
             config: GossipSubConfig::default(),
         }
     }
@@ -59,9 +63,86 @@ impl GossipSubNode {
             self.forward_to_fanout(topic, &message)?;
         }
 
+        // 添加到gossip历史中
+        self.add_to_gossip_history(topic, &message_id);
         Ok(message_id)
     }
 
+    //添加到gossip历史
+    fn add_to_gossip_history(&mut self, topic: &str, message_id: &str) {
+        let history = self
+            .gossip_history
+            .entry(topic.to_string())
+            .or_insert(Vec::new());
+        history.push(message_id.to_string());
+
+        // 保持历史记录在合理大小内
+        if history.len() > self.config.gossip_size * 3 {
+            history.remove(0);
+        }
+    }
+
+    // 执行gossip心跳 - 发送IHAVE消息
+    pub fn gossip_heartbeat(&mut self) -> Result<(), String> {
+        println!("节点 {} 执行gossip心跳", self.node_id);
+
+        for topic in self.topics.clone() {
+            self.send_ihave_messages(&topic)?;
+        }
+
+        // 清理过期的IWANT请求
+        self.cleanup_expired_iwant_requests();
+
+        Ok(())
+    }
+
+    fn send_ihave_messages(&mut self, topic: &str) -> Result<(), String> {
+        // 获取该主题最近的消息id
+        let recent_messages = if let Some(history) = self.gossip_history.get(topic) {
+            let start = if history.len() > self.config.gossip_size {
+                history.len() - self.config.gossip_size
+            } else {
+                0
+            };
+            history[start..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        if recent_messages.is_empty() {
+            return Ok(());
+        }
+
+        // 选择要发送的IHAVE消息的节点（非mesh节点）
+        let target_peers: Vec<String> = self
+            .peers
+            .keys()
+            .filter(|&peer_id| !self.is_in_mesh(topic, peer_id))
+            .take(self.config.gossip_size)
+            .cloned()
+            .collect();
+
+        for peer_id in &target_peers {
+            let ihave_message = GossipMessage::new(MessageType::IHave)
+                .with_topic(topic.to_string())
+                .with_from(self.node_id.clone())
+                .with_to(peer_id.clone())
+                .with_message_ids(recent_messages.clone());
+
+            self.send_message_to_peer(&peer_id, &ihave_message)?;
+        }
+
+        if !recent_messages.is_empty() {
+            println!(
+                "节点 {} 向 {} 个节点发送了IHAVE消息，包含 {} 个消息ID",
+                self.node_id,
+                target_peers.len(),
+                recent_messages.len()
+            );
+        }
+
+        Ok(())
+    }
     // 转发消息给mesh网络中的节点
     fn forward_to_mesh(&self, topic: &str, message: &GossipMessage) -> Result<(), String> {
         if let Some(mesh_peers) = self.mesh.get(topic) {
@@ -194,24 +275,106 @@ impl GossipSubNode {
         Ok(())
     }
 
-    // 处理IHAVE消息（暂时简单实现）
+    // 处理IHAVE消息
     fn handle_ihave_message(
         &mut self,
-        _message: GossipMessage,
-        _from_peer: &str,
+        message: GossipMessage,
+        from_peer: &str,
     ) -> Result<(), String> {
-        // TODO: 实现IHAVE逻辑
+        if let Some(topic) = &message.topic {
+            if !self.topics.contains(topic) {
+                return Ok(());
+            }
+
+            // 检查我们想要哪些消息
+            let mut wanted_messages = Vec::new();
+            for message_id in &message.message_ids {
+                // 如果我们没有这个消息，且不在我们的缓存中，我们就想要它
+                if !self.seen_messages.contains(message_id)
+                    && !self.message_cache.contains_key(message_id)
+                {
+                    wanted_messages.push(message_id.clone());
+                }
+            }
+
+            if !wanted_messages.is_empty() {
+                println!(
+                    "节点 {} 从 {} 收到IHAVE消息，想要 {} 个消息",
+                    self.node_id,
+                    from_peer,
+                    wanted_messages.len()
+                );
+
+                // 记录IWANT请求时间
+                let current_time = GossipMessage::current_timestamp();
+                for message_id in &wanted_messages {
+                    self.iwant_requests.insert(message_id.clone(), current_time);
+                }
+
+                // 发送IWANT消息
+                let iwant_message = GossipMessage::new(MessageType::IWant)
+                    .with_topic(topic.clone())
+                    .with_from(self.node_id.clone())
+                    .with_to(from_peer.to_string())
+                    .with_message_ids(wanted_messages);
+
+                self.send_message_to_peer(from_peer, &iwant_message)?;
+            }
+        }
         Ok(())
     }
 
-    // 处理IWANT消息（暂时简单实现）
+    // 处理IWANT消息
     fn handle_iwant_message(
         &mut self,
-        _message: GossipMessage,
-        _from_peer: &str,
+        message: GossipMessage,
+        from_peer: &str,
     ) -> Result<(), String> {
-        // TODO: 实现IWANT逻辑
+        println!(
+            "节点 {} 从 {} 收到IWANT消息，请求 {} 个消息",
+            self.node_id,
+            from_peer,
+            message.message_ids.len()
+        );
+
+        // 发送请求的消息
+        for message_id in &message.message_ids {
+            if let Some(cached_message) = self.message_cache.get(message_id) {
+                // 创建一个新的消息副本发送给请求者
+                let mut response_message = cached_message.clone();
+                response_message.to = Some(from_peer.to_string());
+
+                self.send_message_to_peer(from_peer, &response_message)?;
+                println!("  发送消息 {} 给 {}", message_id, from_peer);
+            } else {
+                println!("  消息 {} 不在缓存中，无法发送", message_id);
+            }
+        }
         Ok(())
+    }
+
+    // 清理过期的IWANT请求
+    fn cleanup_expired_iwant_requests(&mut self) {
+        let current_time = GossipMessage::current_timestamp();
+        let ttl = self.config.message_cache_ttl;
+
+        self.iwant_requests
+            .retain(|_, &mut timestamp| current_time - timestamp < ttl);
+    }
+
+    // 清理过期的消息缓存
+    pub fn cleanup_message_cache(&mut self) {
+        let current_time = GossipMessage::current_timestamp();
+        let ttl = self.config.message_cache_ttl;
+
+        self.message_cache
+            .retain(|_, message| current_time - message.timestamp < ttl);
+
+        // 同时清理seen_messages中的过期项
+        // 注意：这里简化处理，实际应该记录消息的时间戳
+        if self.seen_messages.len() > 1000 {
+            self.seen_messages.clear();
+        }
     }
 
     // 处理GRAFT消息（暂时简单实现）
